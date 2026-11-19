@@ -20,6 +20,7 @@ import os
 import random
 import re
 import signal
+import unicodedata
 import sys
 import tempfile
 import threading
@@ -63,9 +64,10 @@ YT_TOKEN_JSON = os.environ.get("YT_TOKEN_JSON") or open(
     os.path.join(APP_DIR, "yt_token.json"), encoding="utf-8").read()
 
 PORT = int(os.getenv("PORT", "8000"))
-WORKERS = 8                              # parallel download connections
-UP_CONNECTIONS = 4                       # Telegram upload connections (RAM kam ho to 1-2, warna 3-4)
-UP_WORKERS = 6                           # har connection par ek saath kitne parts
+# Speed settings: env variable se badal sakte ho (phone/kam RAM par kam rakho, PC par badha sakte ho)
+WORKERS = int(os.getenv("DL_WORKERS", "12"))             # ek saath kitne download requests
+UP_CONNECTIONS = int(os.getenv("UP_CONNECTIONS", "4"))   # Telegram upload connections
+UP_WORKERS = int(os.getenv("UP_WORKERS", "8"))           # har connection par ek saath kitne parts
 START_TIME = time.time()
 UPLOAD_CLIENTS = []                      # main() me bharta hai
 CANCEL_EVT = threading.Event()           # cancel dabane par set hota hai
@@ -75,7 +77,7 @@ BG_TASKS = []                            # background tasks ka reference
 CANCEL_BTN = [[Button.inline("❌ Cancel", b"cancel")]]
 PRIVACY = "unlisted"
 CATEGORY_ID = "22"
-UPLOAD_CHUNK = 32 * 1024 * 1024          # 256KB ka multiple
+UPLOAD_CHUNK = int(os.getenv("YT_CHUNK_MB", "16")) * 1024 * 1024   # YouTube chunk (256KB ka multiple)
 # Download size limit (GB). PC par disk jitni ho utni; env variable MAX_SIZE_GB se badlo
 MAX_SIZE = int(float(os.getenv("MAX_SIZE_GB", "4")) * 1024 ** 3)
 TG_LIMIT = 2000 * 1024 * 1024            # Telegram bot ek file max ~2GB hi bhej sakta hai
@@ -536,10 +538,14 @@ def yt_upload_sync(path, title, prog, thumb=None):
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
 
+    prog.text = "⬆️ YouTube upload: Google se login ho raha hai..."
+    t0 = time.time()
     creds = Credentials.from_authorized_user_info(json.loads(YT_TOKEN_JSON), SCOPES)
     if not creds.valid:
         creds.refresh(Request())
     yt = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    print(f"YT: login ho gaya ({time.time() - t0:.1f}s)", flush=True)
+    prog.text = f"⬆️ YouTube upload: pehla hissa ({human(UPLOAD_CHUNK)}) bhej raha hoon... (chunk poora hone par % dikhega)"
 
     body = {
         "snippet": {"title": title[:100], "categoryId": CATEGORY_ID},
@@ -560,14 +566,20 @@ def yt_upload_sync(path, title, prog, thumb=None):
         except HttpError as e:
             if e.resp.status in (500, 502, 503, 504) and retries < 10:
                 retries += 1
-                time.sleep(min(2 ** retries, 60) + random.random())
+                wait = min(2 ** retries, 60) + random.random()
+                print(f"YT: server error {e.resp.status}, retry {retries}/10", flush=True)
+                prog.text = f"⚠️ YouTube server error {e.resp.status}, {wait:.0f}s baad dobara ({retries}/10)"
+                time.sleep(wait)
                 continue
             raise
-        except (ConnectionError, TimeoutError, OSError):
+        except (ConnectionError, TimeoutError, OSError) as e:
             if retries >= 10:
                 raise
             retries += 1
-            time.sleep(min(2 ** retries, 60))
+            wait = min(2 ** retries, 60)
+            print(f"YT: network error {type(e).__name__}, retry {retries}/10", flush=True)
+            prog.text = f"⚠️ Internet/connection dikkat ({type(e).__name__}), {wait}s baad dobara ({retries}/10)"
+            time.sleep(wait)
     prog(total, total)
     vid = resp["id"]
     note = ""
@@ -723,11 +735,51 @@ def parse_rules(text):
     return rules
 
 
+_IGNORE = {ord(c) for c in "\u200b\u200c\u200d\u200e\u200f\u2060\ufeff\u00ad\ufe0e\ufe0f"}
+
+
+def _norm(text):
+    """Text ko 'seedha' roop me badalta hai (𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 -> download, NBSP -> space, chhupe zero-width
+    characters hata deta hai) aur har naye character ka original position bhi return karta hai."""
+    out, idx = [], []
+    for i, ch in enumerate(text):
+        if ord(ch) in _IGNORE:
+            continue
+        for c in unicodedata.normalize("NFKC", ch).casefold():
+            out.append(c)
+            idx.append(i)
+    return "".join(out), idx
+
+
+def _rule_pattern(old, name_mode=False):
+    norm, _ = _norm(old)
+    norm = " ".join(norm.split())
+    sep = r"[\s_.\-]+" if name_mode else r"\s+"
+    return re.compile(sep.join(re.escape(p) for p in norm.split(" ")))
+
+
+def smart_sub(text, name_mode=False):
+    """Rules lagata hai. Fancy/bold Unicode letters, alag tarah ke spaces aur chhupe characters ka farq nahi padta;
+    sirf match hua hissa badalta hai, baaki text jaisa tha waisa rehta hai."""
+    for old, new in SETTINGS["rules"]:
+        try:
+            pat = _rule_pattern(old, name_mode)
+        except Exception:
+            continue
+        if not pat.pattern:
+            continue
+        norm, idx = _norm(text)
+        for m in reversed(list(pat.finditer(norm))):
+            if m.end() == m.start():
+                continue
+            a, b = idx[m.start()], idx[m.end() - 1] + 1
+            text = text[:a] + new + text[b:]
+    return text
+
+
 def apply_rules_raw(text):
     """Sirf rules lagata hai (spaces/lines ko nahi chhedta)."""
-    for old, new in SETTINGS["rules"]:
-        text = re.sub(re.escape(old), lambda _m, n=new: n, text, flags=re.I)
-    return text
+    return smart_sub(text)
 
 
 def apply_rules(text):
@@ -741,9 +793,7 @@ def apply_rules(text):
 
 def apply_rules_name(text):
     """File ke naam par rules: naam me space ki jagah _ . - bhi ho to bhi match hota hai."""
-    for old, new in SETTINGS["rules"]:
-        pat = re.escape(old).replace("\\ ", r"[ _.\-]+")
-        text = re.sub(pat, lambda _m, n=new: n, text, flags=re.I)
+    text = smart_sub(text, name_mode=True)
     text = re.sub(r"[ _]{2,}", " ", text)
     return text.strip(" ._-")
 
@@ -1097,8 +1147,8 @@ async def watchdog(bot, users):
     while True:
         await asyncio.sleep(60)
         try:
-            await asyncio.wait_for(bot.get_me(), 45)
-            await asyncio.wait_for(users[0].get_me(), 45)
+            await asyncio.wait_for(bot.get_me(), 60)
+            await asyncio.wait_for(users[0].get_me(), 60)
             fails = 0
             STATE["last_ok"] = time.time()
         except Exception as e:
@@ -1111,7 +1161,9 @@ async def watchdog(bot, users):
                             await c.connect()
                     except Exception:
                         pass
-            if fails >= 5:
+            t = CURRENT.get("task")
+            busy = bool(t and not t.done())   # upload/download chal raha ho to internet bhara hota hai, ping slow ho sakti hai
+            if fails >= (30 if busy else 5):
                 print("Watchdog: bot atak gaya, restart kar raha hoon...", flush=True)
                 os._exit(1)
 
@@ -1149,8 +1201,14 @@ async def main():
     start_health()
     users = [TelegramClient(StringSession(s), API_ID, API_HASH, connection_retries=-1, retry_delay=2)
              for s in SESSION_STRINGS]
-    for u in users:
-        await u.start()
+    for n, u in enumerate(users, 1):
+        await u.connect()
+        if not await u.is_user_authorized():
+            # start() yahan phone number maangke atak jata, isliye seedha saaf error
+            sys.exit(
+                f"ERROR: Session {n} galat/adhoori/expire hai (string poori copy nahi hui, "
+                f"ya Telegram me terminate ho gayi). gen_session.py se nayi string banao."
+            )
     SESSION_INFO = []
     for n, u in enumerate(users, 1):
         me = await u.get_me()
